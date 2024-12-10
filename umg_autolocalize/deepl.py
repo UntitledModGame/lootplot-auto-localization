@@ -1,3 +1,4 @@
+import collections.abc
 import enum
 
 import httpx
@@ -108,13 +109,33 @@ class DeepLRequest(pydantic.BaseModel):
     formality: Formality | None = None
     model_type: ModelType | None = None
     tag_handling: TagHandling | None = None
+    outline_detection: bool | None = None
+    non_splitting_tags: list[str] | None = None
+    splitting_tags: list[str] | None = None
+
+
+class DeepLTranslation(pydantic.BaseModel):
+    detected_source_language: SourceLanguage
+    text: str
+    billed_characters: int
 
 
 class DeepLResponse(pydantic.BaseModel):
-    pass
+    translations: list[DeepLTranslation]
 
 
 MAX_REQUEST_SIZE = 128000
+
+
+def _count_billed(t: collections.abc.Sequence[DeepLTranslation]):
+    billed = 0
+    for tinfo in t:
+        billed = billed + tinfo.billed_characters
+    return billed
+
+
+class RequestTooLarge(ValueError):
+    pass
 
 
 class Translator:
@@ -126,36 +147,58 @@ class Translator:
     def __call__(
         self,
         target_lang: TargetLanguage,
-        text: list[str],
+        text: collections.abc.Iterable[str],
         /,
         *,
         source_lang: SourceLanguage | None = None,
         context: str | None = None,
         tag_handling: TagHandling | None = None,
+        outline_detection: bool | None = None,
+        non_splitting_tags: collections.abc.Iterable[str] | None = None,
+        splitting_tags: collections.abc.Iterable[str] | None = None,
     ):
         request = DeepLRequest(
-            text=[""], source_lang=source_lang, target_lang=target_lang, context=context, tag_handling=tag_handling
+            text=list(text),
+            source_lang=source_lang,
+            target_lang=target_lang,
+            context=context,
+            tag_handling=tag_handling,
+            outline_detection=outline_detection,
+            non_splitting_tags=None if non_splitting_tags is None else list(non_splitting_tags),
+            splitting_tags=None if splitting_tags is None else list(splitting_tags),
         )
-        overhead = len(request.model_dump_json().encode("utf-8"))
+        request_bytes = request.model_dump_json().encode("utf-8")
+        if len(request_bytes) > MAX_REQUEST_SIZE:
+            raise RequestTooLarge("request size too large")
 
-        for i, txt in enumerate(text):
-            if len(txt.encode("utf-8")) + overhead >= MAX_REQUEST_SIZE:
-                raise ValueError("string at index {i} is too large")
+        response = self._hit_api(request_bytes)
+        return response.translations, _count_billed(response.translations)
 
-        result: list[str] = []
-        start = 0
-        stop = len(text)
-        billed = 0
-
-        while start < stop:
-            # The reason we need to split this because DeepL has limit of 128K request body.
-            request.text = text[start:stop]
-            request_bytes = request.model_dump_json().encode("utf-8")
-            if len(request_bytes) >= MAX_REQUEST_SIZE:
-                stop = stop - 1
-
-            if stop < start:
-                raise ValueError(f"translation text at index {start} is too long")
+    def can_send(
+        self,
+        target_lang: TargetLanguage,
+        text: collections.abc.Iterable[str],
+        /,
+        *,
+        source_lang: SourceLanguage | None = None,
+        context: str | None = None,
+        tag_handling: TagHandling | None = None,
+        outline_detection: bool | None = None,
+        non_splitting_tags: collections.abc.Iterable[str] | None = None,
+        splitting_tags: collections.abc.Iterable[str] | None = None,
+    ):
+        request = DeepLRequest(
+            text=list(text),
+            source_lang=source_lang,
+            target_lang=target_lang,
+            context=context,
+            tag_handling=tag_handling,
+            outline_detection=outline_detection,
+            non_splitting_tags=None if non_splitting_tags is None else list(non_splitting_tags),
+            splitting_tags=None if splitting_tags is None else list(splitting_tags),
+        )
+        request_bytes = request.model_dump_json().encode("utf-8")
+        return len(request_bytes) <= MAX_REQUEST_SIZE
 
     def _hit_api(self, req: bytes):
         response = self.httpx.post(
@@ -164,4 +207,5 @@ class Translator:
             headers={"Content-Type": "application/json", "Authorization": f"DeepL-Auth-Key {self.key}"},
         )
         response.raise_for_status()
-        return DeepLResponse.model_validate(response.json())
+        responnse_json = response.json()
+        return DeepLResponse.model_validate(responnse_json)
